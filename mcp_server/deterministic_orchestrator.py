@@ -93,6 +93,8 @@ class DeterministicPipelineOrchestrator:
             "电子秤": ("digital kitchen food scale precision", ["scale", "kitchen", "digital", "food"], []),
             "厨房秤": ("digital kitchen food scale precision", ["scale", "kitchen", "digital", "food"], []),
             "烘焙秤": ("digital kitchen food scale precision", ["scale", "kitchen", "digital", "food"], []),
+            "防臭袜子": ("mens odor resistant athletic socks", ["socks", "odor", "athletic"], ["shoe", "boot"]),
+            "袜子": ("cotton socks", ["socks"], ["shoe", "boot"]),
             "瑜伽裤": ("yoga pants leggings for women", ["yoga", "legging", "pants"], []),
             "智能手表": ("smart watch fitness tracker", ["watch", "tracker"], ["strap only", "film only"])
         }
@@ -389,7 +391,7 @@ class DeterministicPipelineOrchestrator:
             (() => {
                 const results = [];
                 const negativeKeywords = ['袋', '包装', '气泡', '纸箱', '信封', '发票', '封条', '胶带', '膜', '纸袋', '拉链袋', '彩盒', '瓶', '杯'];
-                const cards = Array.from(document.querySelectorAll('.sm-offer-item, .space-item, [class*="offer-card"], [class*="search-offer"], .common-offer-card'));
+                const cards = Array.from(document.querySelectorAll('.sm-offer-item, .space-item, [class*="offer-card"], [class*="search-offer"], .common-offer-card, [class*="ShopOfferCard"], [class*="offerItem"]'));
 
                 for (let card of cards) {
                     const cardText = card.innerText || '';
@@ -408,7 +410,8 @@ class DeterministicPipelineOrchestrator:
                     }
                     if (!foundOfferId || results.some(r => r.offer_id === foundOfferId)) continue;
 
-                    const pm = cardText.match(/[¥￥]?\\s*([0-9\\.]+)/);
+                    const cleanText = cardText.replace(/\s+/g, '');
+                    const pm = cleanText.match(/[¥￥]([0-9\.]+)/) || cardText.match(/[¥￥]?\s*([0-9\.]+)/);
                     const price = pm ? parseFloat(pm[1]) : 20.0;
                     if (price <= 0.1) continue;
 
@@ -741,45 +744,61 @@ class DeterministicPipelineOrchestrator:
                     if eval_res.get("next_action") == "COMPLETE_NEGOTIATION":
                         chat_status = "所有事实指标已获取完毕，进入算盘核算"
                     else:
-                        # 3.4 填充内容到输入框并触发 Input 事件
-                        clean_msg = msg_to_send.replace("'", "\\'").replace('"', '\\"').replace("\n", "\\n")
-                        js_fill = f"""(() => {{
+                        # 3.3.5 处理可能存在的“发送链接”商品卡片 (优先发送，避免阻塞后续输入)
+                        js_send_link = """(() => {
                             const ifr = document.querySelector('iframe');
                             const idoc = ifr ? (ifr.contentDocument || ifr.contentWindow.document) : document;
-                            const edit = idoc.querySelector('.input-area pre.edit[contenteditable="true"], .input-area [contenteditable="true"], pre.edit[contenteditable="true"], textarea');
+                            let linkBtn = Array.from(idoc.querySelectorAll('button, .btn')).find(b => (b.innerText || '').includes('发送链接'));
+                            if (linkBtn && !linkBtn.disabled) {
+                                linkBtn.click();
+                                return true;
+                            }
+                            return false;
+                        })()"""
+                        await iws.send(json.dumps({"id": 35, "method": "Runtime.evaluate", "params": {"expression": js_send_link, "returnByValue": True}}))
+                        sent_link = json.loads(await iws.recv()).get("result", {}).get("result", {}).get("value")
+                        if sent_link:
+                            logger.info("[State 4] 捕捉到'发送链接'商品卡片，已自动优先发送。")
+                            await asyncio.sleep(1.0)
+                        
+                        # 3.4 填充内容到输入框并触发 Input 事件
+                        clean_msg = msg_to_send.replace("'", "\\'").replace('"', '\\"').replace("\n", "\\n")
+                        js_focus = f"""(() => {{
+                            const ifr = document.querySelector('iframe');
+                            const idoc = ifr ? (ifr.contentDocument || ifr.contentWindow.document) : document;
+                            const edit = idoc.querySelector('.input-area pre.edit[contenteditable="true"], .input-area [contenteditable="true"], pre.edit[contenteditable="true"], textarea, [contenteditable="true"]');
                             if (edit) {{
                                 edit.focus();
                                 idoc.execCommand('selectAll', false, null);
                                 idoc.execCommand('delete', false, null);
-                                idoc.execCommand('insertText', false, '{clean_msg}');
-                                edit.dispatchEvent(new Event('input', {{ bubbles: true }}));
                                 return true;
                             }}
                             return false;
                         }})()"""
-                        await iws.send(json.dumps({"id": 4, "method": "Runtime.evaluate", "params": {"expression": js_fill, "returnByValue": True}}))
+                        await iws.send(json.dumps({"id": 4, "method": "Runtime.evaluate", "params": {"expression": js_focus, "returnByValue": True}}))
                         fill_res = json.loads(await iws.recv()).get("result", {}).get("result", {}).get("value")
+                        
                         if not fill_res:
                             raise RuntimeError("无法定位旺旺输入框，发信失败！")
+                            
+                        # 使用最高优先级的 CDP Input API 注入文本，确保 React 事件不被吞掉
+                        await iws.send(json.dumps({"id": 41, "method": "Input.insertText", "params": {"text": msg_to_send}}))
+                        await iws.recv()
                         await asyncio.sleep(0.5)
 
-                        # 3.5 触发点击发送按钮
+                        # 3.5 触发点击发送按钮 (或者直接使用 CDP 回车)
                         js_send = """(() => {
                             const ifr = document.querySelector('iframe');
                             const idoc = ifr ? (ifr.contentDocument || ifr.contentWindow.document) : document;
-                            // 优先尝试寻找精确的发送按钮
-                            let btn = Array.from(idoc.querySelectorAll('button')).find(b => (b.innerText || '').includes('发送') && !(b.innerText || '').includes('快捷'));
+                            let btn = Array.from(idoc.querySelectorAll('button, .btn')).find(b => {
+                                const t = (b.innerText || '').trim();
+                                return t.includes('发送') && !t.includes('快捷') && !t.includes('链接');
+                            });
                             if (!btn) {
                                 btn = idoc.querySelector('.send-btn, button[class*="send"], [class*="sendBtn"], .btn-send');
                             }
-                            if (btn) {
+                            if (btn && !btn.disabled) {
                                 btn.click();
-                                return true;
-                            }
-                            // 如果实在找不到按钮，尝试回车键
-                            const edit = idoc.querySelector('.input-area pre.edit[contenteditable="true"], .input-area [contenteditable="true"], pre.edit[contenteditable="true"], textarea');
-                            if (edit) {
-                                edit.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13 }));
                                 return true;
                             }
                             return false;
@@ -787,7 +806,12 @@ class DeterministicPipelineOrchestrator:
                         
                         if not self.dry_run:
                             await iws.send(json.dumps({"id": 5, "method": "Runtime.evaluate", "params": {"expression": js_send, "returnByValue": True}}))
-                            await iws.recv()
+                            clicked = json.loads(await iws.recv()).get("result", {}).get("result", {}).get("value")
+                            if not clicked:
+                                await iws.send(json.dumps({"id": 51, "method": "Input.dispatchKeyEvent", "params": {"type": "keyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13}}))
+                                await iws.recv()
+                                await iws.send(json.dumps({"id": 52, "method": "Input.dispatchKeyEvent", "params": {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13}}))
+                                await iws.recv()
                             await asyncio.sleep(1.0)
 
                         # 3.6 送达检验
@@ -1040,7 +1064,13 @@ class DeterministicPipelineOrchestrator:
     # ---------------------------------------------------------
     # 一键到底流水线运行入口
     # ---------------------------------------------------------
-    async def run(self, chinese_keyword: str) -> Dict[str, Any]:
+    async def run(self, chinese_keyword) -> Dict[str, Any]:
+        if isinstance(chinese_keyword, dict):
+            chinese_keyword_str = chinese_keyword.get("chinese_keyword") or chinese_keyword.get("keyword") or str(chinese_keyword)
+        else:
+            chinese_keyword_str = chinese_keyword
+
+        chinese_keyword = chinese_keyword_str
         logger.info(f"==================================================")
         logger.info(f"🚀 启动 100% 确定性全自动选品流水线: 关键词 = '{chinese_keyword}'")
         logger.info(f"==================================================")
