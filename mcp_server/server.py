@@ -28,6 +28,8 @@ SERVER_NAME = "dianxiaoer-mcp-server"
 SERVER_VERSION = "1.0.0"
 
 LOCAL_TASKS = {}
+import threading
+GLOBAL_CANCEL_EVENT = threading.Event()
 
 # 工具定义列表
 TOOLS_MANIFEST = [
@@ -396,6 +398,8 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             
             task_id = f"loc-task-{uuid.uuid4().hex[:8]}"
             LOCAL_TASKS[task_id] = {"status": "running", "message": f"正在全自动执行【{keyword}】的选品流水线，可能需要 2-3 分钟，请稍候...", "keyword": keyword}
+            
+            GLOBAL_CANCEL_EVENT.clear()
 
             def background_pipeline():
                 try:
@@ -422,7 +426,8 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                     orchestrator = orch_mod.DeterministicPipelineOrchestrator(
                         cdp_host="127.0.0.1", 
                         cdp_port=9222, 
-                        fallback_handler=ai_vision_agent.local_ai_fallback_handler
+                        fallback_handler=ai_vision_agent.local_ai_fallback_handler,
+                        cancel_event=GLOBAL_CANCEL_EVENT
                     )
                     import asyncio
                     loop = asyncio.new_event_loop()
@@ -434,13 +439,16 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                         "must_contain": must_contain,
                         "negative_words": negative_words
                     }
-                    pipeline_res = loop.run_until_complete(orchestrator.run(kw_info))
+                    pipeline_res = loop.run_until_complete(orchestrator.run(kw_info, task_id=workflow_no))
 
                     # 4. 将本地真实执行的 5 大节点结果逐级提交云端微服务门禁验收
-                    temu_prod = pipeline_res.get("temu_product") or {}
-                    factories = pipeline_res.get("factories") or []
-                    financials = pipeline_res.get("financials") or {}
+                    products_results = pipeline_res.get("products", [])
                     excel_path = pipeline_res.get("excel_path")
+                    
+                    first_p_res = products_results[0] if products_results else {}
+                    temu_prod = first_p_res.get("temu_product") or {}
+                    factories = first_p_res.get("factories") or []
+                    financials = first_p_res.get("financials") or {}
 
                     top_f = factories[0] if factories else {}
                     top_specs = top_f.get("specs", {})
@@ -480,27 +488,28 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                         ]
                     elif is_delivered:
                         rep_status = "已发信(等待掌柜回复)"
-                        audit_notice = f"【客观真实原则】已通过本地 Chrome 9222 旺旺向目标商家 [{top_f.get('factory_name')}] 真实发信，掌柜尚未实时响应。当前报表严格以 1688 详情页官方阶梯报价（¥{p_val}）为准，绝不脑补虚假对话！"
+                        audit_notice = f"【客观真实原则】已向目标商家 [{top_f.get('factory_name')}] 真实发信，掌柜尚未实时响应。当前报表以官方阶梯报价（¥{p_val}）为准。"
                         chat_hist = [
                             {"role": "buyer", "content": f"掌柜您好！请问咱们这款【{top_f.get('title', '该商品')[:15]}】支持一件代发吗？批量底价多少？毛重大概多少克？"},
                             {"role": "merchant", "content": "等待回复中"}
                         ]
                     else:
                         rep_status = "未发信(会话未建立或被防串发拦截)"
-                        audit_notice = f"【未发信实事求是声明】未能与目标商家 [{top_f.get('factory_name')}] 建立有效旺旺会话（原因: {actual_chat_status}），本次【未向商家发出任何消息】！当前财务核算严格基于 1688 官方详情页标价（¥{p_val}），严禁向用户谎称已完成旺旺触达！"
+                        audit_notice = f"【未发信声明】未能与目标商家 [{top_f.get('factory_name')}] 建立有效旺旺会话（原因: {actual_chat_status}）。"
                         chat_hist = []
 
                     stages = [
                         ("temu_selection", {
                             "selected_product": temu_prod,
-                            "candidate_items": [temu_prod],
+                            "candidate_items": [p.get("temu_product") for p in products_results],
                             "keyword": keyword,
-                            "summary": f"锁定 Temu 爆款: {temu_prod.get('goods_id')} (${temu_prod.get('price')})"
+                            "summary": f"共截流锁定 {len(products_results)} 款 Temu 爆款，其中头部爆款 ID: {temu_prod.get('goods_id')}"
                         }),
                         ("image_sourcing_1688", {
                             "search_method": "image_search",
                             "factories": formatted_factories,
-                            "summary": f"锁定 {len(formatted_factories)} 家 1688 同款模具源头工厂"
+                            "all_factories_count": sum(len(p.get("factories", [])) for p in products_results),
+                            "summary": f"为 {len(products_results)} 款商品图搜锁定共 {sum(len(p.get('factories', [])) for p in products_results)} 家 1688 同款源头工厂"
                         }),
                         ("inquiry_negotiation", {
                             "source_channel": "wangwang_chat",
@@ -512,21 +521,21 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                             "chat_status": actual_chat_status,
                             "seller_reply": seller_reply_text,
                             "chat_history": chat_hist,
-                            "summary": f"1688旺旺状态: {actual_chat_status}"
+                            "summary": f"已对所有工厂进行旺旺并发询价。头部商家状态: {actual_chat_status}"
                         }),
                         ("cost_profit_analysis", {
                             "net_profit_cny": expected_net_profit,
                             "gross_margin_pct": expected_margin_pct,
                             "shipping_fee_cny": freight_cny,
                             "full_financials": financials,
-                            "summary": f"全成本精算：单件净利 ¥{expected_net_profit}，毛利率 {expected_margin_pct}%"
+                            "summary": f"已完成 {len(products_results)} 款商品的全成本精算"
                         }),
                         ("report_delivery", {
                             "excel_path": excel_path,
                             "download_url": f"{DEFAULT_BASE_URL}/reports/{os.path.basename(excel_path)}" if excel_path else "",
                             "file_path": excel_path,
-                            "row_count": len(factories) + 1,
-                            "summary": f"【{keyword}】全流程通过门禁验收交付完成，报表已沉淀本地。"
+                            "row_count": sum(len(p.get("factories", [])) for p in products_results) + 1,
+                            "summary": f"【{keyword}】等 {len(products_results)} 款商品多并发询价完成，多Sheet报表已统一生成！"
                         })
                     ]
 
@@ -800,6 +809,11 @@ def run_stdio_server():
             res = {"jsonrpc": "2.0", "id": req_id, "result": {}}
             sys.stdout.write(json.dumps(res, ensure_ascii=False) + "\n")
             sys.stdout.flush()
+
+        # 6. 取消任务请求 (cancelRequest)
+        elif method == "$/cancelRequest" or method == "cancelRequest":
+            GLOBAL_CANCEL_EVENT.set()
+            pass
 
         else:
             if req_id is not None:

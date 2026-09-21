@@ -52,6 +52,36 @@ class DeterministicPipelineOrchestrator:
         except Exception:
             return False
 
+    async def check_cloud_workflow_status(self, task_id: str):
+        if not task_id or task_id == "UNKNOWN":
+            return
+            
+        logger.info(f"[Orchestrator] 检查云端任务状态: {task_id}")
+        import urllib.error
+        try:
+            # Reusing the module scope authenticated_request or a local fetch
+            # Wait, authenticated_request is in dianxiaoer_auth, we can import it
+            from dianxiaoer_auth import authenticated_request
+            res = authenticated_request(f"/api/v1/agent/workflows/{task_id}", method="GET")
+            status = res.get("status", "running")
+            
+            if status == "cancelled":
+                logger.error(f"[Orchestrator] 检测到云端任务 {task_id} 已被终止(cancelled)，抛出异常强制中止流水线！")
+                raise asyncio.CancelledError(f"Task {task_id} cancelled by user")
+            
+            while status == "paused":
+                logger.warning(f"[Orchestrator] 任务 {task_id} 处于暂停状态，挂起等待...")
+                await asyncio.sleep(5.0)
+                res = authenticated_request(f"/api/v1/agent/workflows/{task_id}", method="GET")
+                status = res.get("status", "running")
+                if status == "cancelled":
+                    raise asyncio.CancelledError(f"Task {task_id} cancelled by user")
+                    
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[Orchestrator] 获取云端状态失败，忽略: {e}")
+
     # ---------------------------------------------------------
     # State 1: 语义标准化 (Semantic Normalization)
     # ---------------------------------------------------------
@@ -1064,7 +1094,7 @@ class DeterministicPipelineOrchestrator:
     # ---------------------------------------------------------
     # 一键到底流水线运行入口
     # ---------------------------------------------------------
-    async def run(self, chinese_keyword) -> Dict[str, Any]:
+    async def run(self, chinese_keyword, task_id: str = None) -> Dict[str, Any]:
         if isinstance(chinese_keyword, dict):
             chinese_keyword_str = chinese_keyword.get("chinese_keyword") or chinese_keyword.get("keyword") or str(chinese_keyword)
         else:
@@ -1078,17 +1108,27 @@ class DeterministicPipelineOrchestrator:
         # State 1
         kw_info = self.normalize_keyword(chinese_keyword)
 
+        await self.check_cloud_workflow_status(task_id)
+
         # State 2
         top_product = await self.harvest_temu(kw_info)
+
+        await self.check_cloud_workflow_status(task_id)
 
         # State 3
         image_search_url, factories = await self.search_1688_by_image(top_product["local_image_path"], top_product=top_product)
 
+        await self.check_cloud_workflow_status(task_id)
+
         # State 4
         negotiated_factories = await self.extract_and_negotiate(factories)
 
+        await self.check_cloud_workflow_status(task_id)
+
         # State 5
         financials = self.calculate_financials(top_product["price"], negotiated_factories)
+
+        await self.check_cloud_workflow_status(task_id)
 
         # State 6
         task_summary = {
