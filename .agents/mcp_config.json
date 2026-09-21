@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "dianxiaoer": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "source venv/bin/activate && python mcp_server/server.py"
+      ],
+      "env": {
+        "DIANXIAOER_BASE_URL": "http://dianxiaoer-skill.ivector.cn"
+      }
+    }
+  }
+}
