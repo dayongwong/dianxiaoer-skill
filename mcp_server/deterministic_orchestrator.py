@@ -32,17 +32,26 @@ logger = logging.getLogger("orchestrator")
 DEFAULT_CDP_HOST = "127.0.0.1"
 DEFAULT_CDP_PORT = 9222
 
+class TaskCancelledException(Exception):
+    pass
+
 class DeterministicPipelineOrchestrator:
-    def __init__(self, cdp_host: str = DEFAULT_CDP_HOST, cdp_port: int = DEFAULT_CDP_PORT, dry_run: bool = False, fallback_handler: Any = None):
+    def __init__(self, cdp_host: str = DEFAULT_CDP_HOST, cdp_port: int = DEFAULT_CDP_PORT, dry_run: bool = False, fallback_handler: Any = None, cancel_event=None):
         self.cdp_host = cdp_host
         self.cdp_port = cdp_port
         self.cdp_base = f"http://{cdp_host}:{cdp_port}"
         self.dry_run = dry_run
         self.fallback_handler = fallback_handler
+        self.cancel_event = cancel_event
         # 动态自适应 scratch 输出目录（跨 macOS 本地与 Linux 云端容器）
         project_root = Path(__file__).resolve().parent.parent.parent.parent
         self.output_dir = str(project_root / "scratch")
         os.makedirs(self.output_dir, exist_ok=True)
+        
+    def _check_cancelled(self):
+        if self.cancel_event and self.cancel_event.is_set():
+            logger.warning("🚨 收到全局中断信号，立即执行急刹车，停止浏览器流水线操作！")
+            raise TaskCancelledException("User Cancelled the Pipeline.")
 
     def is_cdp_available(self) -> bool:
         try:
@@ -51,36 +60,6 @@ class DeterministicPipelineOrchestrator:
                 return resp.status == 200
         except Exception:
             return False
-
-    async def check_cloud_workflow_status(self, task_id: str):
-        if not task_id or task_id == "UNKNOWN":
-            return
-            
-        logger.info(f"[Orchestrator] 检查云端任务状态: {task_id}")
-        import urllib.error
-        try:
-            # Reusing the module scope authenticated_request or a local fetch
-            # Wait, authenticated_request is in dianxiaoer_auth, we can import it
-            from dianxiaoer_auth import authenticated_request
-            res = authenticated_request(f"/api/v1/agent/workflows/{task_id}", method="GET")
-            status = res.get("status", "running")
-            
-            if status == "cancelled":
-                logger.error(f"[Orchestrator] 检测到云端任务 {task_id} 已被终止(cancelled)，抛出异常强制中止流水线！")
-                raise asyncio.CancelledError(f"Task {task_id} cancelled by user")
-            
-            while status == "paused":
-                logger.warning(f"[Orchestrator] 任务 {task_id} 处于暂停状态，挂起等待...")
-                await asyncio.sleep(5.0)
-                res = authenticated_request(f"/api/v1/agent/workflows/{task_id}", method="GET")
-                status = res.get("status", "running")
-                if status == "cancelled":
-                    raise asyncio.CancelledError(f"Task {task_id} cancelled by user")
-                    
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"[Orchestrator] 获取云端状态失败，忽略: {e}")
 
     # ---------------------------------------------------------
     # State 1: 语义标准化 (Semantic Normalization)
@@ -263,6 +242,7 @@ class DeterministicPipelineOrchestrator:
             raw_items = eval_res.get("result", {}).get("value", []) or []
 
         # 确定性强过滤
+        has_specific_filters = bool(must_contain or negative_words)
         valid_items = []
         for it in raw_items:
             t = (it.get("title") or "").lower()
@@ -275,48 +255,56 @@ class DeterministicPipelineOrchestrator:
         if not valid_items and raw_items:
             # 柔性降级 1: 放宽 must_contain 限制，仅保留价格与负向词过滤
             valid_items = [it for it in raw_items if (not price_min or it["price"] >= price_min) and (not price_max or it["price"] <= price_max) and not any(neg in (it.get("title") or "").lower() for neg in negative_words)]
+            has_specific_filters = False
 
         if not valid_items and raw_items:
-            # 柔性降级 2: 取前台第一款实际展示的爆款
-            valid_items = [raw_items[0]]
+            # 柔性降级 2: 取前台实际展示的爆款
+            valid_items = raw_items
+            has_specific_filters = False
 
         if not valid_items:
             err = f"Temu 页面未能检索到符合条件的真实商品（关键词: {search_en}），系统严格遵守真实性红线，坚决不捏造虚假商品！"
             logger.error(f"[State 2] {err}")
             raise RuntimeError(err)
 
-        # 选出销量/热度最高的一款爆款
-        top_product = valid_items[0]
-        top_product["chinese_keyword"] = kw_info.get("chinese_keyword") or search_en
-        logger.info(f"[State 2] 成功截流目标爆款: ID={top_product['goods_id']}, 售价=${top_product['price']}, 销量={top_product['sales_tip']}, 关键词={top_product['chinese_keyword']}")
+        # 按用户条件：如果有特殊过滤条件，保留所有符合条件的；如果无特定条件，默认取 10 款
+        if has_specific_filters:
+            top_products = valid_items
+            logger.info(f"[State 2] 触发条件精准匹配，共截流到 {len(top_products)} 款符合要求的爆款！")
+        else:
+            top_products = valid_items[:10]
+            logger.info(f"[State 2] 无特定筛选词，默认截取销量/热度最高的 {len(top_products)} 款爆款！")
 
-        # 下载主图到本地
-        local_img_path = os.path.join(self.output_dir, f"temu_{top_product['goods_id']}.jpg")
-        thumb_url = top_product["thumb"]
-        if thumb_url:
-            import ssl
-            ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-            req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as r, open(local_img_path, "wb") as f:
-                f.write(r.read())
-            logger.info(f"[State 2] 爆款主图已本地持久化: {local_img_path}")
-        top_product["local_image_path"] = local_img_path
-
-        return top_product
-
+        for top_product in top_products:
+            top_product["chinese_keyword"] = kw_info.get("chinese_keyword") or search_en
+            
+            # 下载主图到本地
+            local_img_path = os.path.join(self.output_dir, f"temu_{top_product['goods_id']}.jpg")
+            thumb_url = top_product["thumb"]
+            if thumb_url:
+                import ssl
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                try:
+                    req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as r, open(local_img_path, "wb") as f:
+                        f.write(r.read())
+                except Exception as e:
+                    logger.warning(f"下载图片失败 {thumb_url}: {e}")
+            top_product["local_image_path"] = local_img_path
+        return top_products
     # ---------------------------------------------------------
     # State 3: 1688 拍立淘视觉以图搜款
     # ---------------------------------------------------------
     async def search_1688_by_image(self, local_img_path: str, top_product: Dict[str, Any] = None) -> Tuple[str, List[Dict[str, Any]]]:
+        self._check_cancelled()
         if not self.is_cdp_available():
             raise RuntimeError("【真实性红线】本地 Chrome 9222 调试端口未启动或不可用！系统严格禁止捏造任何 1688 工厂与价格，请先拉起 Chrome 9222 后再试！")
 
         logger.info("[State 3] 启动 1688 拍立淘原生以图搜款...")
-        # 寻找 1688 首页 tab 或打开
+        # 寻找 1688 首页 tab 或新建
         req_pages = urllib.request.Request(f"{self.cdp_base}/json/list")
-
         with urllib.request.urlopen(req_pages, timeout=5) as resp:
             pages = json.loads(resp.read().decode("utf-8"))
         
@@ -343,152 +331,239 @@ class DeterministicPipelineOrchestrator:
                     if m.get("id") == curr_id:
                         return m.get("result", {})
 
-            # 确保在 1688 首页
+            # 1. 确保在 1688 首页
             await cdp_send("Page.navigate", {"url": "https://www.1688.com/"})
             await asyncio.sleep(2.5)
 
-            # 获取 input[type="file"] 的真实 nodeId（通过严格消息 ID 匹配，避免被 DOM 事件打乱）
-            await cdp_send("DOM.enable")
-            doc = await cdp_send("DOM.getDocument", {"depth": -1})
-            root_id = doc.get("root", {}).get("nodeId", 1)
-
-            q_res = await cdp_send("DOM.querySelector", {"nodeId": root_id, "selector": "input[type=\"file\"]"})
-            file_node_id = q_res.get("nodeId")
-
-            if not file_node_id:
-                logger.warning("[State 3] DOM 未能定位到 input[type='file']，尝试从根节点深层探测...")
-                await asyncio.sleep(1.0)
-                q_res = await cdp_send("DOM.querySelector", {"nodeId": root_id, "selector": "input[type=\"file\"]"})
-                file_node_id = q_res.get("nodeId")
-
-            if file_node_id:
-                # 注入文件
-                await cdp_send("DOM.setFileInputFiles", {"files": [local_img_path], "nodeId": file_node_id})
-                logger.info("[State 3] 爆款主图已成功推入 1688 拍立淘视觉引擎...")
-                await asyncio.sleep(4.0)
+            # 2. 定位以图搜款真实文件上传 input
+            eval_input = await cdp_send("Runtime.evaluate", {
+                "expression": 'document.querySelector("input[type=\'file\'][aria-label*=\'以图搜款\'], input.overlay--ArN7epSI, input[type=\'file\'][accept*=\'jpg\'], input[type=\'file\']")'
+            })
+            obj_id = eval_input.get("result", {}).get("objectId")
+            if obj_id:
+                await cdp_send("DOM.setFileInputFiles", {"files": [local_img_path], "objectId": obj_id})
+                logger.info("[State 3] 爆款主图已通过 objectId 注入 1688 文件选择器...")
             else:
-                logger.warning("[State 3] 未定位到拍立淘上传按钮，准备启用货源直连通道...")
+                await cdp_send("DOM.enable")
+                doc = await cdp_send("DOM.getDocument", {"depth": -1})
+                root_id = doc.get("root", {}).get("nodeId", 1)
+                q_res = await cdp_send("DOM.querySelector", {"nodeId": root_id, "selector": "input[type='file']"})
+                file_node_id = q_res.get("nodeId")
+                if file_node_id:
+                    await cdp_send("DOM.setFileInputFiles", {"files": [local_img_path], "nodeId": file_node_id})
+                    logger.info("[State 3] 爆款主图已通过 nodeId 注入 1688 文件选择器...")
+                else:
+                    logger.warning("[State 3] DOM 未定位到 input[type='file']")
 
-        # 查找生成的以图搜款页面
-        req_pages2 = urllib.request.Request(f"{self.cdp_base}/json/list")
-        with urllib.request.urlopen(req_pages2, timeout=5) as resp:
-            pages2 = json.loads(resp.read().decode("utf-8"))
-        
-        img_search_tab = next((p for p in pages2 if "pc-image-search" in p.get("url", "")), None)
-        if not img_search_tab:
-            # 等待额外 3 秒轮询检测拍立淘结果页
-            for retry in range(3):
-                await asyncio.sleep(2.0)
+            # 3. 检查并点击弹出的以图搜款“搜索”确认按钮（采用可信鼠标事件点击，规避 React 合成事件拦截）
+            for retry_click in range(10):
+                await asyncio.sleep(0.5)
+                coords_func = """(() => {
+                    const btn = document.querySelector('.actionPrimary--sz2L3jNq, .imageSearchPopover--f82RkwsD button.actionPrimary--sz2L3jNq, [class*="actionPrimary"]');
+                    if (!btn) return null;
+                    const rect = btn.getBoundingClientRect();
+                    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+                })()"""
+                coords_res = await cdp_send("Runtime.evaluate", {"expression": coords_func, "returnByValue": True})
+                coords = coords_res.get("result", {}).get("value")
+                if coords and coords.get("x") and coords.get("y"):
+                    cx, cy = coords["x"], coords["y"]
+                    await cdp_send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": cx, "y": cy})
+                    await cdp_send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                    await asyncio.sleep(0.05)
+                    await cdp_send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                    logger.info("[State 3] 已成功点击 1688 以图搜款搜索确认按钮！")
+                    break
+
+            # 4. 检测是否触发了风控验证码（滑块/文字挑战）
+            check_captcha_expr = """(() => {
+                const el = document.querySelector('#baxia-dialog-content, .nc_wrapper, #nocaptcha, iframe[src*="captcha"], .baxia-dialog, [class*="dialog-content"]');
+                return !!el;
+            })()"""
+            cap_check = await cdp_send("Runtime.evaluate", {"expression": check_captcha_expr, "returnByValue": True})
+            if cap_check.get("result", {}).get("value"):
+                logger.warning("🛡️ [State 3] 1688 触发了安全验证滑块！已将页面置顶，等待用户人机协同处理...")
                 try:
-                    with urllib.request.urlopen(req_pages2, timeout=5) as resp:
-                        pages2 = json.loads(resp.read().decode("utf-8"))
-                    img_search_tab = next((p for p in pages2 if "pc-image-search" in p.get("url", "")), None)
-                    if img_search_tab:
-                        break
+                    await cdp_send("Page.bringToFront")
                 except Exception:
                     pass
+                solved = False
+                for _ in range(20):
+                    await asyncio.sleep(2.0)
+                    cap_check = await cdp_send("Runtime.evaluate", {"expression": check_captcha_expr, "returnByValue": True})
+                    if not cap_check.get("result", {}).get("value"):
+                        logger.info("✅ [State 3] 人机协同成功：安全验证已解除！继续执行以图搜款...")
+                        solved = True
+                        break
+                if not solved:
+                    err_msg = "【反爬拦截中断】1688 触发了安全滑块验证码且用户未在时限内完成滑动！依据真实性红线，系统严禁降级关键词搜货，严禁伪造假数据，流程已安全终止。"
+                    logger.error(f"[State 3] {err_msg}")
+                    raise RuntimeError(err_msg)
+
+        # 5. 查找生成的以图搜款结果页面（严格禁止降级关键词搜索！）
+        img_search_tab = None
+        for retry in range(12):
+            await asyncio.sleep(1.0)
+            try:
+                req_pages2 = urllib.request.Request(f"{self.cdp_base}/json/list")
+                with urllib.request.urlopen(req_pages2, timeout=5) as resp:
+                    pages2 = json.loads(resp.read().decode("utf-8"))
+                img_search_tab = next((p for p in pages2 if "pc-image-search" in p.get("url", "") or ("imageSearch" in p.get("url", "") and "1688" in p.get("url", ""))), None)
+                if img_search_tab:
+                    break
+            except Exception:
+                pass
 
         if not img_search_tab:
-            logger.warning("[State 3] 拍立淘未自动弹窗，启动 1688 关键词实力货源直连通道...")
-            chinese_search_kw = (top_product.get("chinese_keyword") or "").strip()
-            if not chinese_search_kw:
-                title_cns = re.findall(r"[\u4e00-\u9fa5]+", top_product.get("title", ""))
-                chinese_search_kw = "".join(title_cns) if title_cns else ""
-            if not chinese_search_kw:
-                raise RuntimeError("无法提取到有效的中文关键词进行 1688 检索，系统拒绝使用硬编码兜底！")
-
-            # 导航到 1688 标准货源搜索页（严格采用 .htm 与 charset=utf8，彻底杜绝 GBK 转码错误与空白推荐页）
-            search_page_url = f"https://s.1688.com/selloffer/offer_search.htm?keywords={urllib.parse.quote(chinese_search_kw)}&charset=utf8"
-            logger.info(f"[State 3] 1688 精准货源直连 URL: {search_page_url}")
-            put_req = urllib.request.Request(f"{self.cdp_base}/json/new?{urllib.parse.quote(search_page_url)}", method="PUT")
-            with urllib.request.urlopen(put_req, timeout=5) as resp:
-                img_search_tab = json.loads(resp.read().decode("utf-8"))
-            await asyncio.sleep(4.0)
+            err_msg = "【图搜未检出】未能检测到 1688 拍立淘生成的以图搜款结果页面！依据真实性红线原则，系统严禁降级为关键词搜索（关键词搜出来的商品与选品不匹配），严禁编造任何假工厂与假数据！流程已安全终止。"
+            logger.error(f"[State 3] {err_msg}")
+            raise RuntimeError(err_msg)
 
         image_search_url = img_search_tab.get("url")
         logger.info(f"[State 3] 成功生成官方以图搜款结果页: {image_search_url}")
 
-        # 从图搜结果提取 Top 3~5 家同款源头工厂
+        # 6. 从以图搜款结果提取真实同款源头工厂
         factories = []
-        async with websockets.connect(img_search_tab.get("webSocketDebuggerUrl"), max_size=20*1024*1024) as ws:
-            # 等待图搜商品异步渲染并滚动
-            await asyncio.sleep(2.5)
-            await ws.send(json.dumps({"id": 5, "method": "Runtime.evaluate", "params": {"expression": "window.scrollBy(0, 600);"}}))
-            await ws.recv()
-            await asyncio.sleep(1.5)
-
-            js = """
-            (() => {
-                const results = [];
-                const negativeKeywords = ['袋', '包装', '气泡', '纸箱', '信封', '发票', '封条', '胶带', '膜', '纸袋', '拉链袋', '彩盒', '瓶', '杯'];
-                const cards = Array.from(document.querySelectorAll('.sm-offer-item, .space-item, [class*="offer-card"], [class*="search-offer"], .common-offer-card, [class*="ShopOfferCard"], [class*="offerItem"]'));
-
-                for (let card of cards) {
-                    const cardText = card.innerText || '';
-                    if (negativeKeywords.some(neg => cardText.includes(neg))) continue;
-
-                    let foundOfferId = '';
-                    const as = Array.from(card.querySelectorAll('a'));
-                    for (let a of as) {
-                        const m = a.href.match(/offer[\\/](\\d+)\\.html/) || a.href.match(/offerIds?=(\\d+)/);
-                        if (m) { foundOfferId = m[1]; break; }
+        card_extractor_js = r"""(() => {
+            const results = [];
+            const seen_ids = new Set();
+            const cards = Array.from(document.querySelectorAll(
+                '[class*="searchOfferWrapper"], [class*="searchOfferItem"], [class*="offerHoverWrapper"], [class*="cardWrapper"], [class*="sm-offer-item"], div[data-tracker="offer"]'
+            ));
+            for (let card of cards) {
+                let offerId = "";
+                const as = Array.from(card.querySelectorAll("a"));
+                for (let a of as) {
+                    const href = a.href || "";
+                    if (href.indexOf("offerId=") !== -1) {
+                        try {
+                            const u = new URL(href);
+                            offerId = u.searchParams.get("offerId");
+                            if (offerId) break;
+                        } catch(e) {}
                     }
-                    if (!foundOfferId) {
-                        const html = card.outerHTML;
-                        const m2 = html.match(/offerIds?=(\\d+)/) || html.match(/offer[\\/](\\d+)\\.html/);
-                        if (m2) foundOfferId = m2[1];
-                    }
-                    if (!foundOfferId || results.some(r => r.offer_id === foundOfferId)) continue;
-
-                    const cleanText = cardText.replace(/\s+/g, '');
-                    const pm = cleanText.match(/[¥￥]([0-9\.]+)/) || cardText.match(/[¥￥]?\s*([0-9\.]+)/);
-                    const price = pm ? parseFloat(pm[1]) : 20.0;
-                    if (price <= 0.1) continue;
-
-                    const lines = cardText.split('\\n').map(s => s.trim()).filter(Boolean);
-                    const title = lines[0] || '1688热销商品';
-                    let company = lines[lines.length - 1] || '1688源头厂家';
-                    if (company.includes('¥') || company.length > 20 || /^[a-f0-9]{16,}$/i.test(company)) {
-                        company = '1688源头实力工厂';
-                    }
-
-                    results.push({
-                        offer_id: foundOfferId,
-                        detail_url: `https://detail.1688.com/offer/${foundOfferId}.html`,
-                        factory_name: company,
-                        title: title,
-                        price_cny: price
-                    });
                 }
-                return results.slice(0, 10);
-            })()
-            """
-            await ws.send(json.dumps({"id": 10, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
-            res = json.loads(await ws.recv())
-            factories = res.get("result", {}).get("result", {}).get("value", []) or []
+                if (!offerId) {
+                    const m = card.outerHTML.match(/offerId[="]+(\d+)/i) || 
+                              card.outerHTML.match(/offer[\/](\d+)\.html/i) || 
+                              card.outerHTML.match(/_(\d{10,14})/);
+                    if (m) offerId = m[1];
+                }
+                if (!offerId && card.dataset && card.dataset.renderkey) {
+                    const rkm = card.dataset.renderkey.match(/(\d{10,14})/);
+                    if (rkm) offerId = rkm[1];
+                }
+                if (!offerId || seen_ids.has(offerId)) continue;
+                seen_ids.add(offerId);
 
+                // 1. 商品标题
+                const titleRow = card.querySelector('[class*="titleText"], [class*="offerTitle"], [class*="title"]');
+                let title = titleRow ? titleRow.innerText.trim() : "";
+                if (!title) {
+                    const lines = (card.innerText || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+                    title = lines.find(l => l.length > 6 && !l.includes("¥") && !l.includes("找相似") && !l.includes("券") && !l.includes("费")) || lines[0] || "1688以图搜款同款货源";
+                }
 
-        if not factories:
-            logger.warning("[State 3] 首次卡片提取为空，正在尝试页面滚动与多级选择器深度重试...")
-            for retry_i in range(3):
-                await asyncio.sleep(1.5)
-                async with websockets.connect(img_search_tab.get("webSocketDebuggerUrl"), max_size=20*1024*1024) as ws:
-                    await ws.send(json.dumps({"id": 20 + retry_i, "method": "Runtime.evaluate", "params": {"expression": "window.scrollBy(0, 800);"}}))
-                    await ws.recv()
-                    await ws.send(json.dumps({"id": 30 + retry_i, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
-                    res = json.loads(await ws.recv())
-                    factories = res.get("result", {}).get("result", {}).get("value", []) or []
-                    if factories:
-                        logger.info(f"[State 3] 深度重试第 {retry_i+1} 次成功抓获真实动态货源 {len(factories)} 家！")
+                // 2. 真实价格提取
+                let price = null;
+                const priceItem = card.querySelector('[class*="priceItem"], [class*="offerPrice"], [class*="price"]');
+                if (priceItem) {
+                    const pTxt = priceItem.innerText.replace(/[¥\s]/g, "");
+                    const mPrice = pTxt.match(/([\d\.]+)/);
+                    if (mPrice) price = parseFloat(mPrice[1]);
+                }
+                if (price === null) {
+                    const mPriceFallback = (card.innerText || "").match(/[¥￥]\s*([\d\.]+)/);
+                    if (mPriceFallback) price = parseFloat(mPriceFallback[1]);
+                }
+
+                // 3. 工厂/店铺名提取
+                let company = "";
+                const shopEl = card.querySelector('[class*="shopName"], [class*="company"], [class*="supplier"]');
+                if (shopEl) {
+                    company = shopEl.innerText.trim();
+                }
+                if (!company) {
+                    const mUid = card.outerHTML.match(/uid=([^&"'\s]+)/);
+                    if (mUid) {
+                        try { company = decodeURIComponent(mUid[1]); } catch(e) { company = mUid[1]; }
+                    }
+                }
+                if (!company) {
+                    const cm = (card.innerText || "").match(/([\u4e00-\u9fa5A-Za-z0-9]{2,20}(?:有限公司|制造厂|加工厂|针织厂|塑胶厂|电子厂|制品厂|实业厂|五金厂|商行|企业|科技))/);
+                    if (cm) company = cm[1];
+                }
+                company = (company || "1688源头工厂").replace(/^(7天无理由|入驻\d+年|退货包运费)+/, "").trim();
+
+                // 4. 图片
+                const imgEl = card.querySelector('img[class*="mainImg"], img');
+                const imgUrl = imgEl ? (imgEl.src || imgEl.getAttribute("data-src") || "") : "";
+
+                results.push({
+                    offer_id: offerId,
+                    detail_url: "https://detail.1688.com/offer/" + offerId + ".html",
+                    factory_name: company,
+                    title: title.replace(/找相似/g, "").trim(),
+                    price_cny: price,
+                    image_url: imgUrl,
+                    search_method: "image_search"
+                });
+            }
+            return results.slice(0, 15);
+        })()"""
+
+        async with websockets.connect(img_search_tab.get("webSocketDebuggerUrl"), max_size=20*1024*1024) as ws:
+            msg_counter = 0
+            async def cdp_send_res(method, params=None):
+                nonlocal msg_counter
+                msg_counter += 1
+                curr_id = msg_counter
+                await ws.send(json.dumps({"id": curr_id, "method": method, "params": params or {}}))
+                while True:
+                    m = json.loads(await ws.recv())
+                    if m.get("id") == curr_id:
+                        return m.get("result", {})
+
+            # 检查以图搜结果页是否有反爬滑块
+            cap_check2 = await cdp_send_res("Runtime.evaluate", {"expression": check_captcha_expr, "returnByValue": True})
+            if cap_check2.get("result", {}).get("value"):
+                logger.warning("🛡️ [State 3] 结果页触发了风控滑块！正在等待用户滑动完成...")
+                try:
+                    await cdp_send_res("Page.bringToFront")
+                except Exception:
+                    pass
+                solved2 = False
+                for _ in range(20):
+                    await asyncio.sleep(2.0)
+                    ck = await cdp_send_res("Runtime.evaluate", {"expression": check_captcha_expr, "returnByValue": True})
+                    if not ck.get("result", {}).get("value"):
+                        solved2 = True
                         break
+                if not solved2:
+                    raise RuntimeError("【反爬拦截中断】1688 结果页安全验证未通过，严禁伪造假数据，流程已终止。")
+
+            # 轮询等待商品卡片异步渲染完成（最多等待 15 秒）
+            for wait_i in range(15):
+                await asyncio.sleep(1.0)
+                await cdp_send_res("Runtime.evaluate", {"expression": "window.scrollBy(0, 400);"})
+                eval_res = await cdp_send_res("Runtime.evaluate", {"expression": card_extractor_js, "returnByValue": True})
+                items = eval_res.get("result", {}).get("value", []) or []
+                if len(items) >= 1:
+                    factories = items
+                    logger.info(f"[State 3] 第 {wait_i+1} 秒成功解析抓获 1688 真实同款货源 {len(factories)} 家！")
+                    break
 
         if not factories:
-            err_msg = f"1688 实时货源检索未能在页面抓取到关键词【{chinese_search_kw}】的真实商品卡片，可能触发了反爬滑块或页面结构调整，系统严格遵循真实性原则，坚决拒绝伪造任何假工厂与假数据！"
+            err_msg = "【图搜货源为空】1688 拍立淘以图搜款未能从页面提取到有效商品卡片！系统严格遵循真实性红线，坚决拒绝伪造假工厂与假数据，拒绝降级关键词搜货！流程已安全终止。"
             logger.error(f"[State 3] {err_msg}")
             raise RuntimeError(err_msg)
 
         logger.info(f"[State 3] 锁定 {len(factories)} 家 100% 同款源头模具工厂！")
         return image_search_url, factories
+
+
+
+
 
     # ---------------------------------------------------------
     # State 4: 详情页官方参数解构 + 并发旺旺发信与多轮追问兜底
@@ -500,6 +575,7 @@ class DeterministicPipelineOrchestrator:
 
         results = []
         for idx, f in enumerate(factories[:10]):
+            self._check_cancelled()
             offer_id = str(f.get("offer_id") or "")
             detail_url = f.get("detail_url") or f"https://detail.1688.com/offer/{offer_id}.html"
             specs = {"official_weight_g": 120.0, "official_dimensions": "10*8*3.5", "ladder_price_cny": f["price_cny"]}
@@ -769,6 +845,7 @@ class DeterministicPipelineOrchestrator:
                     short_title = re.sub(r'跨境|欧美|2026|新款|爆款|秋冬|春夏|厂家|批发|现货', '', raw_title).strip()[:18]
                     clean_item_name = short_title if len(short_title) >= 2 else (f.get("title") or "这款商品")[:20]
                     msg_to_send = eval_res.get("followup_message") or f"掌柜您好！请问咱们这款【{clean_item_name}】支持一件代发吗？首批50-100件批量底价多少？单件带包装毛重大概多少克？期待回复！"
+                    msg_to_send += f"\n商品链接: {detail_url}"
                     clean_msg = msg_to_send.replace("'", "\'").replace("\n", "\\n")
 
                     if eval_res.get("next_action") == "COMPLETE_NEGOTIATION":
@@ -796,11 +873,17 @@ class DeterministicPipelineOrchestrator:
                         js_focus = f"""(() => {{
                             const ifr = document.querySelector('iframe');
                             const idoc = ifr ? (ifr.contentDocument || ifr.contentWindow.document) : document;
-                            const edit = idoc.querySelector('.input-area pre.edit[contenteditable="true"], .input-area [contenteditable="true"], pre.edit[contenteditable="true"], textarea, [contenteditable="true"]');
+                            let edit = idoc.querySelector('.input-area pre.edit[contenteditable="true"], .input-area [contenteditable="true"], pre.edit[contenteditable="true"], textarea, [contenteditable="true"]');
+                            if (!edit) {{
+                                edit = idoc.querySelector('textarea[placeholder*="请输入"], textarea[placeholder*="Enter"], div[placeholder*="请输入"]');
+                            }}
                             if (edit) {{
                                 edit.focus();
-                                idoc.execCommand('selectAll', false, null);
-                                idoc.execCommand('delete', false, null);
+                                try {{
+                                    idoc.execCommand('selectAll', false, null);
+                                    idoc.execCommand('delete', false, null);
+                                }} catch(e) {{}}
+                                if (edit.tagName && edit.tagName.toLowerCase() === 'textarea') edit.value = '';
                                 return true;
                             }}
                             return false;
@@ -809,7 +892,7 @@ class DeterministicPipelineOrchestrator:
                         fill_res = json.loads(await iws.recv()).get("result", {}).get("result", {}).get("value")
                         
                         if not fill_res:
-                            raise RuntimeError("无法定位旺旺输入框，发信失败！")
+                            raise RuntimeError("无法定位旺旺输入框，发信失败！(JS未能找到输入框元素)")
                             
                         # 使用最高优先级的 CDP Input API 注入文本，确保 React 事件不被吞掉
                         await iws.send(json.dumps({"id": 41, "method": "Input.insertText", "params": {"text": msg_to_send}}))
@@ -820,7 +903,7 @@ class DeterministicPipelineOrchestrator:
                         js_send = """(() => {
                             const ifr = document.querySelector('iframe');
                             const idoc = ifr ? (ifr.contentDocument || ifr.contentWindow.document) : document;
-                            let btn = Array.from(idoc.querySelectorAll('button, .btn')).find(b => {
+                            let btn = Array.from(idoc.querySelectorAll('button, .btn, .send-btn')).find(b => {
                                 const t = (b.innerText || '').trim();
                                 return t.includes('发送') && !t.includes('快捷') && !t.includes('链接');
                             });
@@ -1052,28 +1135,35 @@ class DeterministicPipelineOrchestrator:
             cell.alignment = center_align
 
         # 写入行
-        p = task_summary["temu_product"]
-        fin = task_summary["financials"]
-        for f in task_summary["factories"]:
-            official_price = f["specs"]["ladder_price_cny"]
-            seller_reply = f.get("seller_reply")
-            chat_status_str = f.get("chat_status") or "官方挂牌价核算"
-            if seller_reply:
-                negotiated_price_str = f"¥{official_price} (掌柜实复: {seller_reply[:20]})"
-            else:
-                negotiated_price_str = "掌柜暂未回复"
+        if "products" in task_summary:
+            product_results = task_summary["products"]
+        else:
+            # Fallback for old single product task_summary
+            product_results = [{"temu_product": task_summary["temu_product"], "financials": task_summary["financials"], "factories": task_summary["factories"]}]
 
-            screenshot_display = f.get("screenshot_path") or "已真机发信存证"
+        for p_res in product_results:
+            p = p_res["temu_product"]
+            fin = p_res["financials"]
+            for f in p_res["factories"]:
+                official_price = f["specs"]["ladder_price_cny"]
+                seller_reply = f.get("seller_reply")
+                chat_status_str = f.get("chat_status") or "官方挂牌价核算"
+                if seller_reply:
+                    negotiated_price_str = f"¥{official_price} (掌柜实复: {seller_reply[:20]})"
+                else:
+                    negotiated_price_str = "掌柜暂未回复"
 
-            row = [
-                p["goods_id"], p["title"], p["price"], p["sales_tip"],
-                f["factory_name"], f["detail_url"], "支持",
-                f"¥{official_price}", negotiated_price_str, screenshot_display, chat_status_str,
-                f["specs"]["official_weight_g"], f["specs"]["official_dimensions"],
-                fin["conservative_track"]["net_profit_cny"], f"{fin['conservative_track']['gross_margin_pct']}%",
-                fin["negotiated_track"]["net_profit_cny"], f"{fin['negotiated_track']['gross_margin_pct']}%"
-            ]
-            ws.append(row)
+                screenshot_display = f.get("screenshot_path") or "已真机发信存证"
+
+                row = [
+                    p["goods_id"], p["title"], p["price"], p["sales_tip"],
+                    f["factory_name"], f["detail_url"], "支持",
+                    f"¥{official_price}", negotiated_price_str, screenshot_display, chat_status_str,
+                    f["specs"]["official_weight_g"], f["specs"]["official_dimensions"],
+                    fin["conservative_track"]["net_profit_cny"], f"{fin['conservative_track']['gross_margin_pct']}%",
+                    fin["negotiated_track"]["net_profit_cny"], f"{fin['negotiated_track']['gross_margin_pct']}%"
+                ]
+                ws.append(row)
 
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(headers)):
             for cell in row:
@@ -1094,7 +1184,7 @@ class DeterministicPipelineOrchestrator:
     # ---------------------------------------------------------
     # 一键到底流水线运行入口
     # ---------------------------------------------------------
-    async def run(self, chinese_keyword, task_id: str = None) -> Dict[str, Any]:
+    async def run(self, chinese_keyword) -> Dict[str, Any]:
         if isinstance(chinese_keyword, dict):
             chinese_keyword_str = chinese_keyword.get("chinese_keyword") or chinese_keyword.get("keyword") or str(chinese_keyword)
         else:
@@ -1108,42 +1198,48 @@ class DeterministicPipelineOrchestrator:
         # State 1
         kw_info = self.normalize_keyword(chinese_keyword)
 
-        await self.check_cloud_workflow_status(task_id)
-
         # State 2
-        top_product = await self.harvest_temu(kw_info)
+        self._check_cancelled()
+        top_products = await self.harvest_temu(kw_info)
 
-        await self.check_cloud_workflow_status(task_id)
+        all_products_results = []
+        for top_product in top_products:
+            self._check_cancelled()
+            logger.info(f"--- 开始深度处理爆款商品: {top_product.get('title')[:30]} ---")
+            try:
+                # State 3
+                image_search_url, factories = await self.search_1688_by_image(top_product["local_image_path"], top_product=top_product)
 
-        # State 3
-        image_search_url, factories = await self.search_1688_by_image(top_product["local_image_path"], top_product=top_product)
+                # State 4
+                negotiated_factories = await self.extract_and_negotiate(factories)
 
-        await self.check_cloud_workflow_status(task_id)
+                # State 5
+                financials = self.calculate_financials(top_product["price"], negotiated_factories)
 
-        # State 4
-        negotiated_factories = await self.extract_and_negotiate(factories)
+                all_products_results.append({
+                    "temu_product": top_product,
+                    "image_search_url": image_search_url,
+                    "factories": negotiated_factories,
+                    "financials": financials
+                })
+            except Exception as e:
+                logger.error(f"处理爆款商品 {top_product.get('goods_id')} 时发生错误: {e}")
+                continue
 
-        await self.check_cloud_workflow_status(task_id)
-
-        # State 5
-        financials = self.calculate_financials(top_product["price"], negotiated_factories)
-
-        await self.check_cloud_workflow_status(task_id)
+        if not all_products_results:
+            raise RuntimeError("所有选出的爆款在后续询价流程中均遭遇失败！")
 
         # State 6
         task_summary = {
             "keyword": chinese_keyword,
             "keyword_info": kw_info,
-            "temu_product": top_product,
-            "image_search_url": image_search_url,
-            "factories": negotiated_factories,
-            "financials": financials
+            "products": all_products_results
         }
         excel_path = self.export_excel(task_summary)
         task_summary["excel_path"] = excel_path
 
         logger.info("==================================================")
-        logger.info("✅ 选品流水线全流程确定性闭环完成！")
+        logger.info(f"✅ 选品流水线全流程确定性闭环完成！共成功深度核算 {len(all_products_results)} 款商品。")
         logger.info(f"📁 本地 Excel: {excel_path}")
         logger.info("==================================================")
         return task_summary
@@ -1155,11 +1251,8 @@ async def main():
     res = await orchestrator.run(kw)
     print("\n--- JSON 摘要 ---")
     print(json.dumps({
-        "goods_id": res["temu_product"]["goods_id"],
-        "price_usd": res["temu_product"]["price"],
-        "factories_count": len(res["factories"]),
-        "excel_path": res["excel_path"],
-        "margin": res["financials"]["conservative_track"]["gross_margin_pct"]
+        "products_count": len(res["products"]),
+        "excel_path": res["excel_path"]
     }, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
